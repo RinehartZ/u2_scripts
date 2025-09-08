@@ -1,0 +1,19 @@
+# Rule file for qBittorrent per-torrent category and upload limit based on tracker host
+# Units: up_limit_kib is in KiB/s (0 means unlimited)
+
+defaults:
+  # Optional default category when no rule matches. Empty string means leave unchanged.
+  category: ""
+  # Optional default upload limit in KiB/s when no rule matches. 0 means unlimited.
+  up_limit_kib: 0
+
+rules:
+  # Exact host match example
+  - match: "tracker.private.example"
+    category: "Private"
+    up_limit_kib: 500
+
+  # Regex match example (Python regex, matched against the tracker hostname)
+  - match_regex: ".*public.*"
+    category: "Public"
+    up_limit_kib: 0
