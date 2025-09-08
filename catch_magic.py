@@ -1,5 +1,5 @@
 """必填参数只有 cookie，之后修改 BK_DIR 和 WT_DIR，即可运行
-依赖 pip3 install requests lxml bs4 loguru pytz
+依赖 pip3 install requests lxml bs4 loguru pytz PyYAML
 u2_api: https://github.com/kysdm/u2_api，自动获取 token: https://greasyfork.org/zh-CN/scripts/428545
 """
 
@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import pytz
+import uuid
 
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,8 +18,11 @@ from time import sleep, time
 from typing import Dict, List, Union, Any
 
 from requests import get, ReadTimeout, ConnectTimeout
+import requests
 from bs4 import BeautifulSoup
 from loguru import logger
+from urllib.parse import urlparse
+import yaml
 
 COOKIES = {'nexusphp_u2': ''}  # type: Dict[str, str]
 '网站 cookie'
@@ -81,6 +85,203 @@ R_ARGS = {'cookies': COOKIES,
 'requests 模块参数'
 MIN_ADD_INTERVAL = 0  # type: Union[int, float]
 '重复添加同一种子的最小时间间隔(s)'
+
+# ============ qBittorrent 集成配置 ============
+USE_QB = True  # 如果为真，直接通过 qBittorrent Web API 添加种子并按 tracker 设置分类与上传限速
+QBT_HOST = os.environ.get('QBT_HOST', 'http://localhost:8080')  # qB WebUI 地址
+QBT_USERNAME = os.environ.get('QBT_USERNAME', '')  # WebUI 用户名
+QBT_PASSWORD = os.environ.get('QBT_PASSWORD', '')  # WebUI 密码
+# 规则文件，参考 /workspace/qbt_add/rules.yaml；可用环境变量 QBT_RULES_FILE 覆盖
+QBT_RULES_FILE = os.environ.get('QBT_RULES_FILE', '/workspace/qbt_add/rules.yaml')
+QBT_INSECURE = bool(int(os.environ.get('QBT_INSECURE', '0')))  # 1 跳过 TLS 校验
+QBT_TIMEOUT = int(os.environ.get('QBT_TIMEOUT', '20'))  # 添加后等待种子出现的超时时间（秒）
+
+
+# ============ qBittorrent Web API 与规则工具函数 ============
+def qb_login(session: requests.Session, base_url: str, username: str, password: str) -> bool:
+    if not username or not password:
+        logger.error('QBT_USERNAME 或 QBT_PASSWORD 未配置')
+        return False
+    try:
+        resp = session.post(f"{base_url}/api/v2/auth/login", data={"username": username, "password": password})
+        if resp.status_code == 200 and resp.text == 'Ok.':
+            return True
+        logger.error(f'qB 登录失败: {resp.status_code} {resp.text}')
+    except Exception as e:
+        logger.exception(e)
+    return False
+
+
+def qb_add_torrent_file(session: requests.Session, base_url: str, file_path: str, tag: str, paused: bool = True) -> bool:
+    try:
+        with open(file_path, 'rb') as f:
+            files = {"torrents": (os.path.basename(file_path), f, "application/x-bittorrent")}
+            data = {"paused": 'true' if paused else 'false', "tags": tag}
+            resp = session.post(f"{base_url}/api/v2/torrents/add", data=data, files=files)
+        if resp.status_code == 200:
+            return True
+        logger.error(f'qB 添加种子失败: {resp.status_code} {resp.text}')
+    except Exception as e:
+        logger.exception(e)
+    return False
+
+
+def qb_find_torrents_by_tag(session: requests.Session, base_url: str, tag: str):
+    try:
+        resp = session.get(f"{base_url}/api/v2/torrents/info", params={"tag": tag})
+        if resp.status_code == 200:
+            return resp.json()
+        logger.error(f'qB 查询标签失败: {resp.status_code} {resp.text}')
+    except Exception as e:
+        logger.exception(e)
+    return []
+
+
+def qb_get_trackers(session: requests.Session, base_url: str, torrent_hash: str):
+    try:
+        resp = session.get(f"{base_url}/api/v2/torrents/trackers", params={"hash": torrent_hash})
+        if resp.status_code == 200:
+            return resp.json()
+        logger.error(f'qB 获取 trackers 失败: {resp.status_code} {resp.text}')
+    except Exception as e:
+        logger.exception(e)
+    return []
+
+
+def extract_tracker_hosts(trackers: list) -> list:
+    hosts = []
+    for tr in trackers or []:
+        url = tr.get('url', '')
+        if not url:
+            continue
+        try:
+            parsed = urlparse(url)
+            if parsed.hostname:
+                hosts.append(parsed.hostname)
+        except Exception:
+            continue
+    # 去重且保持顺序
+    seen = set()
+    uniq = []
+    for h in hosts:
+        if h not in seen:
+            seen.add(h)
+            uniq.append(h)
+    return uniq
+
+
+def load_rules(path: str) -> dict:
+    try:
+        if not os.path.isfile(path):
+            logger.warning(f'规则文件不存在: {path}，将不应用分类/限速')
+            return {"defaults": {}, "rules": []}
+        with open(path, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f) or {}
+        data.setdefault('defaults', {})
+        data.setdefault('rules', [])
+        return data
+    except Exception as e:
+        logger.exception(e)
+        return {"defaults": {}, "rules": []}
+
+
+def match_rules(hosts: list, rules_cfg: dict):
+    category = None
+    up_limit_kib = None
+    for host in hosts:
+        for rule in rules_cfg.get('rules', []):
+            match = rule.get('match')
+            match_regex = rule.get('match_regex')
+            hit = False
+            if match and host == match:
+                hit = True
+            elif match_regex:
+                try:
+                    if re.search(match_regex, host):
+                        hit = True
+                except re.error:
+                    pass
+            if hit:
+                if rule.get('category'):
+                    category = rule['category']
+                if 'up_limit_kib' in rule:
+                    try:
+                        up_limit_kib = int(rule['up_limit_kib'])
+                    except Exception:
+                        pass
+                return category, up_limit_kib
+    defaults = rules_cfg.get('defaults', {})
+    if category is None and defaults.get('category'):
+        category = defaults.get('category')
+    if up_limit_kib is None and 'up_limit_kib' in defaults:
+        try:
+            up_limit_kib = int(defaults.get('up_limit_kib', 0))
+        except Exception:
+            up_limit_kib = None
+    return category, up_limit_kib
+
+
+def qb_get_categories(session: requests.Session, base_url: str) -> dict:
+    try:
+        resp = session.get(f"{base_url}/api/v2/torrents/categories")
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as e:
+        logger.exception(e)
+    return {}
+
+
+def qb_create_category_if_missing(session: requests.Session, base_url: str, category: str) -> None:
+    if not category:
+        return
+    cats = qb_get_categories(session, base_url)
+    if category in cats:
+        return
+    try:
+        resp = session.post(f"{base_url}/api/v2/torrents/createCategory", data={"category": category})
+        if resp.status_code != 200:
+            logger.warning(f'创建分类失败: {resp.status_code} {resp.text}')
+    except Exception as e:
+        logger.exception(e)
+
+
+def qb_set_category(session: requests.Session, base_url: str, torrent_hash: str, category: str) -> None:
+    if not category:
+        return
+    try:
+        resp = session.post(f"{base_url}/api/v2/torrents/setCategory", data={"hashes": torrent_hash, "category": category})
+        if resp.status_code != 200:
+            logger.warning(f'设置分类失败: {resp.status_code} {resp.text}')
+    except Exception as e:
+        logger.exception(e)
+
+
+def qb_set_upload_limit(session: requests.Session, base_url: str, torrent_hash: str, limit_kib_per_s):
+    if limit_kib_per_s is None:
+        return
+    limit_bytes = max(0, int(limit_kib_per_s) * 1024)
+    try:
+        resp = session.post(f"{base_url}/api/v2/torrents/setUploadLimit", data={"hashes": torrent_hash, "limit": str(limit_bytes)})
+        if resp.status_code != 200:
+            logger.warning(f'设置上传限速失败: {resp.status_code} {resp.text}')
+    except Exception as e:
+        logger.exception(e)
+
+
+def qb_remove_tag(session: requests.Session, base_url: str, torrent_hash: str, tag: str) -> None:
+    try:
+        session.post(f"{base_url}/api/v2/torrents/removeTags", data={"hashes": torrent_hash, "tags": tag})
+    except Exception:
+        pass
+
+
+def qb_resume(session: requests.Session, base_url: str, torrent_hash: str) -> None:
+    try:
+        resp = session.post(f"{base_url}/api/v2/torrents/resume", data={"hashes": torrent_hash})
+        if resp.status_code != 200:
+            logger.warning(f'恢复任务失败: {resp.status_code} {resp.text}')
+    except Exception as e:
+        logger.exception(e)
 
 
 class CatchMagic:
@@ -205,7 +406,48 @@ class CatchMagic:
             with open(f'{BK_DIR}/[U2].{tid}.torrent', 'wb') as f:
                 f.write(get(to_info['dl_link'], **R_ARGS).content)
 
-        shutil.copy(f'{BK_DIR}/[U2].{tid}.torrent', f'{WT_DIR}/[U2].{tid}.torrent')
+        bk_path = f'{BK_DIR}/[U2].{tid}.torrent'
+
+        # 优先通过 qB Web API 添加并按 tracker 应用分类与上传限速
+        if USE_QB:
+            try:
+                session = requests.Session()
+                session.verify = not QBT_INSECURE
+                if qb_login(session, QBT_HOST, QBT_USERNAME, QBT_PASSWORD):
+                    unique_tag = f"u2-catch-{uuid.uuid4()}"
+                    if qb_add_torrent_file(session, QBT_HOST, bk_path, unique_tag, paused=True):
+                        deadline = time() + QBT_TIMEOUT
+                        torrents = []
+                        while time() < deadline:
+                            torrents = qb_find_torrents_by_tag(session, QBT_HOST, unique_tag)
+                            if torrents:
+                                break
+                            sleep(0.5)
+                        if torrents:
+                            tor = torrents[0]
+                            thash = tor.get('hash')
+                            trackers = qb_get_trackers(session, QBT_HOST, thash)
+                            hosts = extract_tracker_hosts(trackers)
+                            rules_cfg = load_rules(QBT_RULES_FILE)
+                            category, up_limit_kib = match_rules(hosts, rules_cfg)
+                            if category:
+                                qb_create_category_if_missing(session, QBT_HOST, category)
+                                qb_set_category(session, QBT_HOST, thash, category)
+                            qb_set_upload_limit(session, QBT_HOST, thash, up_limit_kib)
+                            qb_remove_tag(session, QBT_HOST, thash, unique_tag)
+                            qb_resume(session, QBT_HOST, thash)
+                            logger.info(f"通过 qB 添加种子 {tid}，分类={category or '无'}，上传限速(KiB/s)={up_limit_kib if up_limit_kib is not None else '不限'}，hosts={hosts}")
+                            self.tid_add_time[tid] = time()
+                            return
+                        else:
+                            logger.error('qB 未在超时时间内找到新添加的任务，回退到监控目录复制')
+                else:
+                    logger.error('qB 登录失败，回退到监控目录复制')
+            except Exception as e:
+                logger.exception(e)
+
+        # 回退：复制到 BT 客户端监控目录
+        shutil.copy(bk_path, f'{WT_DIR}/[U2].{tid}.torrent')
         logger.info(f"Download torrent {tid}, name {to_info['to_name']}")
         self.tid_add_time[tid] = time()
 
