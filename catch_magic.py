@@ -95,6 +95,7 @@ QBT_PASSWORD = os.environ.get('QBT_PASSWORD', '')  # WebUI 密码
 QBT_RULES_FILE = os.environ.get('QBT_RULES_FILE', '/workspace/qbt_add/rules.yaml')
 QBT_INSECURE = bool(int(os.environ.get('QBT_INSECURE', '0')))  # 1 跳过 TLS 校验
 QBT_TIMEOUT = int(os.environ.get('QBT_TIMEOUT', '20'))  # 添加后等待种子出现的超时时间（秒）
+QBT_FIXED_CATEGORY = os.environ.get('QBT_FIXED_CATEGORY', 'keep')  # 固定分类名；若不想固定可设为空字符串
 
 
 # ============ qBittorrent Web API 与规则工具函数 ============
@@ -430,6 +431,9 @@ class CatchMagic:
                             hosts = extract_tracker_hosts(trackers)
                             rules_cfg = load_rules(QBT_RULES_FILE)
                             category, up_limit_kib = match_rules(hosts, rules_cfg)
+                            # 固定分类优先于规则
+                            if QBT_FIXED_CATEGORY:
+                                category = QBT_FIXED_CATEGORY
                             if category:
                                 qb_create_category_if_missing(session, QBT_HOST, category)
                                 qb_set_category(session, QBT_HOST, thash, category)
