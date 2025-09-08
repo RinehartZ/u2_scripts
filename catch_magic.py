@@ -434,6 +434,9 @@ class CatchMagic:
                             # 固定分类优先于规则
                             if QBT_FIXED_CATEGORY:
                                 category = QBT_FIXED_CATEGORY
+                            # 针对包含 daydream.dmhy.best 的 tracker，限速 50 MB/s
+                            if any('daydream.dmhy.best' in h for h in hosts):
+                                up_limit_kib = 50 * 1024
                             if category:
                                 qb_create_category_if_missing(session, QBT_HOST, category)
                                 qb_set_category(session, QBT_HOST, thash, category)
