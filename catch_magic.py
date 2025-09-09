@@ -289,6 +289,15 @@ class CatchMagic:
     pre_suf = [['时区', '，点击修改。'], ['時區', '，點擊修改。'], ['Current timezone is ', ', click to change.']]
 
     def __init__(self):
+        # 确保备份与监控目录存在
+        try:
+            os.makedirs(BK_DIR, exist_ok=True)
+        except Exception as e:
+            logger.warning(f"创建备份目录失败: {BK_DIR} - {e}")
+        try:
+            os.makedirs(WT_DIR, exist_ok=True)
+        except Exception as e:
+            logger.warning(f"创建监控目录失败: {WT_DIR} - {e}")
         self.checked, self.magic_id_0, self.tid_add_time = deque([], maxlen=200), None, {}
         with open(DATA_PATH, 'a', encoding='utf-8'):
             pass
@@ -399,7 +408,11 @@ class CatchMagic:
                                     f"{'downloading' if len(tr.contents) == 12 else 'seeding'} the torrent")
                         return
 
-        if f'[U2].{tid}.torrent' in os.listdir(BK_DIR):
+        try:
+            bk_list = os.listdir(BK_DIR)
+        except FileNotFoundError:
+            bk_list = []
+        if f'[U2].{tid}.torrent' in bk_list:
             if not RE_DOWNLOAD:
                 logger.info(f'Torrent {tid} | you have downloaded this torrent before')
                 return
