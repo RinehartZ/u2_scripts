@@ -14,7 +14,7 @@ set -euo pipefail
 SERVICE_NAME="u2-magic"
 RUN_USER="$(logname 2>/dev/null || echo ${SUDO_USER:-${USER}})"
 PYTHON_BIN=""
-SRC_URL=""
+SRC_URL="https://raw.githubusercontent.com/RinehartZ/u2_scripts/refs/heads/main/u2_magic.py"
 WORKDIR="/root/u2_scripts"
 
 while [[ $# -gt 0 ]]; do
